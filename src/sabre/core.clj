@@ -84,7 +84,8 @@
                      task-fn (get handlers (:request t))]
                  (logging/info (str "Start task " k " : " (:request t) " " (:args t)))
                  (swap! workers conj {:future (future
-                                                (try (apply task-fn (:args t))
+                                                (try (task-fn (:args t) {:key k
+                                                                         :meta (:meta t)})
                                                      (catch Exception e (do (.printStackTrace e)
                                                                             nil))))
                                       :key k
