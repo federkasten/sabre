@@ -1,7 +1,5 @@
 (ns sabre.core
   (:require [clojure.tools.logging :as logging]
-            [clojure.core.async :as async :refer [go go-loop]]
-            [clojure.edn :as edn]
             [lackd.core :as lackd]
             [sabre.status :as status]
             [sabre.util :refer [task-key]]))
@@ -10,21 +8,19 @@
   [server {:keys [request args] :as task}]
   (when server
     (let [db (:db server)
+          queue (:queue server)
           args (:args task)
-          key (task-key (:request task))
-          queue-key (:current-queue-key server)
-          queue (lackd/get-sequence! db queue-key)]
-      (lackd/put-entry! db queue-key (conj queue key))
-      (lackd/put-entry! db key (pr-str task))
+          key (task-key (:request task))]
+      (lackd/push-item! queue key)
+      (lackd/put-entry! db key task)
       key)))
 
 (defn halt!
   [server key]
   (when server
     (let [db (:db server)
-          queue-key (:abort-queue-key server)
-          queue (lackd/get-sequence! db queue-key)]
-      (lackd/put-entry! db queue-key (conj queue key))
+          abort-queue (:abort-queue server)]
+      (lackd/push-item! abort-queue key)
       key)))
 
 (defn start-server!
@@ -34,97 +30,100 @@
                           num-workers
                           data-dir
                           sleep]
-                   :or {on-finished (fn [key request args meta])
+                   :or {on-finished (fn [args {:keys [key request meta]}])
                         num-workers 1
                         data-dir "/tmp/server"
                         sleep 1000}
                    :as params}]
    (let [env (lackd/open-env! data-dir)
          db (lackd/open-db! env name)
-         running? (atom true)
-         workers (atom #{})
-         current-queue-key (str "current-" name)
-         running-queue-key (str "running-" name)
-         abort-queue-key (str "abort-" name)]
+         queue (lackd/open-queue! env (str name "-queue"))
+         abort-queue (lackd/open-queue! env (str name "-abort-queue"))
+         available? (atom true)
+         workers (atom {})
+         running-set-key (str "running-" name)]
+
+     ;; Initialize
+     (lackd/put-entry! db running-set-key #{})
 
      ;; Start server main loop
-     (go-loop []
-       (when @running?
+     (future
+       (while @available?
 
-         (let [current (lackd/get-sequence! db current-queue-key)
-               running (lackd/get-sequence! db running-queue-key)
-               abort (set (lackd/get-sequence! db abort-queue-key))
-               aborting-workers (if (empty? abort)
-                                  []
-                                  (filter #(contains? abort (:key %)) @workers))
-               finished-workers (filter #(future-done? (:future %)) @workers)
-               all-keys (set (map :key @workers))
-               finished-keys (set (map :key finished-workers))
-               rest-running (filter #(and (not (contains? finished-keys %))
-                                          (contains? all-keys %)) running)
-               num-starts (- num-workers (count rest-running))
-               waits (take num-starts current)
-               new-running (concat rest-running waits)
-               new-current (drop num-starts current)]
+         (try
+           (let [running (lackd/get-entry! db running-set-key)
+                 finished-workers (filter #(future-done? (:future %))
+                                          (vals @workers))
+                 finished-keys (set (map :key finished-workers))
+                 rest-running (filter #(not (contains? finished-keys %)) running)
+                 num-starts (- num-workers (count rest-running))]
 
-           ;; Update workers
-           (lackd/put-entry! db running-queue-key new-running)
-           (doseq [w finished-workers]
-             (on-finished (:key w)
-                          (get-in w [:params :request])
-                          (get-in w [:params :args])
-                          (get-in w [:params :meta]))
-             (logging/info (str "Finished task " (:key w)))
-             (swap! workers disj w))
+             ;; When finished
+             (doseq [w finished-workers]
+               (on-finished (get-in w [:params :args])
+                            {:key (:key w)
+                             :meta (get-in w [:params :meta])
+                             :request (get-in w [:params :request])})
+               (logging/info (str "Finished task " (:key w)))
+               (lackd/update-entry! db running-set-key #(disj % (:key w)))
+               (swap! workers dissoc (:key w)))
 
-           ;; Start new workers
-           (when-not (empty? waits)
-             (doseq [k waits]
-               (let [t (edn/read-string (lackd/get-entry! db k))
-                     task-fn (get handlers (:request t))]
-                 (logging/info (str "Start task " k " : " (:request t) " " (:args t)))
-                 (swap! workers conj {:future (future
-                                                (try (task-fn (:args t) {:key k
-                                                                         :meta (:meta t)})
-                                                     (catch Exception e (do (.printStackTrace e)
-                                                                            nil))))
-                                      :key k
-                                      :params {:request (:request t)
-                                               :args (:args t)
-                                               :meta (:meta t)}}))))
-           ;; Cancel workerks
-           (when-not (empty? aborting-workers)
-             (doseq [w aborting-workers]
-               (future-cancel (:future w))))
+             ;; Start new task
+             (loop [n num-starts]
+               (when (pos? n)
+                 (when-let [k (lackd/pop-item! queue)]
+                   (let [t (lackd/get-entry! db k)
+                         task-fn (get handlers (:request t))]
+                     (logging/info (str "Start task " k " : " (:request t) " " (:args t)))
+                     (lackd/update-entry! db running-set-key #(conj % k))
+                     (swap! workers
+                            assoc
+                            k
+                            {:future (future
+                                       (try (task-fn (:args t) {:key k
+                                                                :meta (:meta t)})
+                                            (catch InterruptedException e
+                                              (logging/info (str "Interrupted task " k " : " (:request t) " " (:args t))))
+                                            (catch Exception e (do (.printStackTrace e)
+                                                                   nil))))
+                             :key k
+                             :params {:request (:request t)
+                                      :args (:args t)
+                                      :meta (:meta t)}})
+                     (recur (dec n))))))
 
-           ;; Update queue
-           (lackd/put-entry! db current-queue-key new-current))
+             ;; Cancel workerks
+             (loop [key (lackd/pop-item! abort-queue)]
+               (when key
+                 (when-let [f (get-in @workers [key :future])]
+                   (future-cancel f))
+                 (recur (lackd/pop-item! abort-queue)))))
 
-         (Thread/sleep sleep)
-         (recur)))
+           (catch Exception e (do (.printStackTrace e)
+                                  nil)))
+
+         (Thread/sleep sleep)))
 
      ;; Return server instance
      {:name name
-      :current-queue-key current-queue-key
-      :running-queue-key running-queue-key
-      :abort-queue-key abort-queue-key
-      :running? running?
-      :handlers handlers
-      :params params
       :env env
-      :db db})))
+      :db db
+      :queue queue
+      :abort-queue abort-queue
+      :running-set-key running-set-key
+      :available? available?
+      :handlers handlers
+      :params params})))
 
 (defn stop-server!
   [server]
-  (reset! (:running? server) false)
-  ;; Swap task queue
-  (let [db (:db server)
-        current-queue-key (:current-queue-key server)
-        running-queue-key (:running-queue-key server)
-        current (lackd/get-sequence! db current-queue-key)
-        running (lackd/get-sequence! db running-queue-key)]
-    (lackd/put-entry! db current-queue-key (concat running current))
-    (lackd/put-entry! db running-queue-key []))
+  (reset! (:available? server) false)
+  ;; Swap and close all
+  (let [running (lackd/get-entry! (:db server) (:running-set-key server))]
+    (doseq [k running]
+      (lackd/insert-item! (:queue server) k)))
   (lackd/close-db! (:db server))
+  (lackd/close-queue! (:queue server))
+  (lackd/close-queue! (:abort-queue server))
   (lackd/close-env! (:env server))
   nil)
