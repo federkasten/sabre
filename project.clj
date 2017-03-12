@@ -1,4 +1,4 @@
-(defproject sabre "0.1.0"
+(defproject sabre "0.2.0-SNAPSHOT"
   :description "A framework to implement robust multi-threading servers for Clojure"
   :url "https://github.com/federkasten/sabre"
   :license {:name "Apache License, Version 2.0"
