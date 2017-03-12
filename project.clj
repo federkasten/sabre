@@ -4,7 +4,7 @@
   :license {:name "Apache License, Version 2.0"
             :url "http://www.apache.org/licenses/LICENSE-2.0.html"}
   :dependencies [[org.clojure/tools.logging "0.3.1"]
-                 [lackd "0.1.1-SNAPSHOT"]]
+                 [lackd "0.2.0"]]
   :profiles {:dev {:global-vars {*warn-on-reflection* true
                                  *assert* true}
                    :dependencies [[org.clojure/clojure "1.8.0"]]}
